@@ -1,0 +1,11 @@
+{
+  "site": "https://example.com",
+  "steps": [
+    {"action": "read", "element": "h1"},
+    {"action": "check", "text": "Example Domain"},
+    {"action": "scroll", "where": "bottom"},
+    {"action": "scroll", "where": "top"},
+    {"action": "shot", "filename": "homepage"},
+    {"action": "html", "filename": "page_source"}
+  ]
+}  
