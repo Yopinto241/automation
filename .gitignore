@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+last_plan.json
+output/*
+!output/.gitkeep
