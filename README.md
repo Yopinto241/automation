@@ -33,9 +33,17 @@ python run_automation.py
 Run a saved plan without prompts:
 
 ```powershell
-python run_automation.py --file plans\example_plan.json --headless
+python run_automation.py --file plans\example_plan.json --headless --browser firefox
 ```
 
-On Windows, `automate.bat` runs the same command using the active `python` on `PATH`.
+Interactive mode lists detected Chrome, Firefox/LibreWolf, and Edge installations and lets you choose one. On Windows, `automate.bat` runs the same command using the active `python` on `PATH`.
+
+Run the unit tests with:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+Each run also produces a structured `results.json` summary. Artifact names are restricted to the run output directory, and invalid plans are rejected before browser startup.
 
 Only automate sites and accounts where you have permission. Avoid storing credentials or other secrets in plans.

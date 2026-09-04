@@ -19,6 +19,7 @@ import re
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PLAN_DIR = os.path.join(SCRIPT_DIR, "plans")
@@ -26,7 +27,9 @@ OUT_DIR = os.path.join(SCRIPT_DIR, "output")
 LAST_PLAN = os.path.join(SCRIPT_DIR, "last_plan.json")
 RESULTS_FILE = os.path.join(OUT_DIR, "results.txt")
 
-BROWSER = "firefox"  # -> LibreWolf (patched local SeleniumBase build)
+DEFAULT_BROWSER = "firefox"
+SUPPORTED_BROWSERS = ("chrome", "firefox", "edge")
+MAX_RETRIES = 2
 
 
 # --------------------------------------------------------------------------
@@ -135,6 +138,78 @@ def looks_like_xpath(ident):
     return ident.lower().startswith("xpath=") or ident.startswith(("/", "("))
 
 
+def xpath_literal(value):
+    """Return an XPath string literal that supports both quote characters."""
+    if "'" not in value:
+        return "'%s'" % value
+    if '"' not in value:
+        return '"%s"' % value
+    parts = value.split("'")
+    arguments = []
+    for index, part in enumerate(parts):
+        if part:
+            arguments.append('"%s"' % part)
+        if index < len(parts) - 1:
+            arguments.append('"\'"')
+    return "concat(%s)" % ", ".join(arguments)
+
+
+def safe_output_name(filename, default_name, extension):
+    """Keep generated artifact names inside the current run directory."""
+    name = (filename or "").strip() or default_name
+    name = os.path.basename(name.replace("\\", "/"))
+    if not name.lower().endswith(extension):
+        name += extension
+    if name in (".", "..") or name.startswith("."):
+        raise ValueError("artifact filename must be a normal file name")
+    return name
+
+
+def discover_browsers():
+    """Return installed supported browsers and their executable paths."""
+    candidates = {
+        "chrome": [
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ],
+        "firefox": [
+            os.path.expandvars(r"%ProgramFiles%\Mozilla Firefox\firefox.exe"),
+            os.path.expandvars(r"%ProgramFiles%\LibreWolf\librewolf.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\LibreWolf\librewolf.exe"),
+        ],
+        "edge": [
+            os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+        ],
+    }
+    found = []
+    for browser in SUPPORTED_BROWSERS:
+        path = next((candidate for candidate in candidates[browser]
+                     if os.path.isfile(candidate)), None)
+        if path:
+            found.append({"name": browser, "path": path})
+    return found
+
+
+def choose_browser():
+    """Show installed browsers and return the user's selection."""
+    browsers = discover_browsers()
+    if not browsers:
+        print("No supported browser executable was found.")
+        print("Install Firefox, LibreWolf, Chrome, or Edge and try again.")
+        return DEFAULT_BROWSER
+    print("\nAVAILABLE BROWSERS:")
+    for index, browser in enumerate(browsers, 1):
+        print("  %d. %-7s %s" % (index, browser["name"], browser["path"]))
+    while True:
+        choice = input("Choose a browser [1]: ").strip() or "1"
+        if choice.isdigit() and 1 <= int(choice) <= len(browsers):
+            selected = browsers[int(choice) - 1]
+            print("[selected %s]" % selected["name"])
+            return selected["name"]
+        print("!! choose one of the listed numbers")
+
+
 def resolve_selector(ident, kind=None):
     """
     Convert a user identifier into a (selector, kind) pair where kind is one
@@ -156,22 +231,22 @@ def resolve_selector(ident, kind=None):
     if low.startswith("name="):
         return ident[5:].strip(), "name"
     if low.startswith(("link=", "text=")):
-        esc = ident.split("=", 1)[1].strip().replace("'", "\\'")
+        esc = xpath_literal(ident.split("=", 1)[1].strip())
         return ("//*[(self::a or self::button or self::span or self::input)"
-                "[contains(normalize-space(), '%s')]][1]" % esc), "xpath"
+                "[contains(normalize-space(), %s)]][1]" % esc), "xpath"
     if looks_like_xpath(ident):
         return ident, "xpath"
     if looks_like_css(ident):
         return ident, "css"
 
     # Plain free text -> guess where it belongs on the page
-    esc = ident.replace("'", "\\'")
+    esc = xpath_literal(ident)
     if kind == "type":
         xp = (
             "//*[(self::input or self::textarea or self::select)"
-            "[contains(@placeholder, '%s') or contains(@aria-label, '%s')"
-            " or contains(@name, '%s') or contains(@id, '%s')]]"
-            " | //label[contains(normalize-space(), '%s')]"
+            "[contains(@placeholder, %s) or contains(@aria-label, %s)"
+            " or contains(@name, %s) or contains(@id, %s)]]"
+            " | //label[contains(normalize-space(), %s)]"
             "/following::*[1][self::input or self::textarea or self::select]"
             % (esc, esc, esc, esc, esc)
         )
@@ -179,11 +254,11 @@ def resolve_selector(ident, kind=None):
     if kind == "click":
         xp = ("//*[(self::button or self::a or self::span or self::div or"
               " self::input[contains(@type,'submit') or contains(@type,'button')])"
-              "[contains(normalize-space(), '%s')]][1]" % esc)
+              "[contains(normalize-space(), %s)]][1]" % esc)
         return xp, "xpath"
     # generic (read/hover/wait): any element containing that text
-    xp = ("//*[not(self::script) and not(self::style)]"
-          "[contains(normalize-space(), '%s')][1]" % esc)
+        xp = ("//*[not(self::script) and not(self::style)]"
+                    "[contains(normalize-space(), %s)][1]" % esc)
     return xp, "xpath"
 
 
@@ -223,7 +298,36 @@ def save_plan(plan, path):
 def load_plan(path):
     with open(path, "r", encoding="utf-8") as f:
         plan = json.load(f)
-    assert "site" in plan and "steps" in plan
+    validate_plan(plan)
+    return plan
+
+
+def validate_plan(plan):
+    """Validate plan structure before opening a browser."""
+    if not isinstance(plan, dict) or not isinstance(plan.get("steps"), list):
+        raise ValueError("plan must be an object with a steps list")
+    if "site" not in plan or not isinstance(plan["site"], str):
+        raise ValueError("plan site must be a string")
+    for index, step in enumerate(plan["steps"], 1):
+        if not isinstance(step, dict) or not isinstance(step.get("action"), str):
+            raise ValueError("step %d must have an action" % index)
+        action = step["action"]
+        if action not in {name for name, _ in ACTIVITY_MENU}:
+            raise ValueError("step %d has unknown action: %s" % (index, action))
+        for field in {
+            "open": ("url",), "type": ("field", "value"),
+            "click": ("element",), "select": ("dropdown", "option"),
+            "press": ("key",), "wait_for": ("element",),
+            "check": ("text",), "hover": ("element",),
+        }.get(action, ()):
+            if not isinstance(step.get(field), str) or not step[field].strip():
+                raise ValueError("step %d requires non-empty %s" % (index, field))
+        if action == "wait":
+            try:
+                if float(step.get("seconds", 1)) < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise ValueError("step %d has invalid wait seconds" % index)
     return plan
 
 
@@ -251,9 +355,10 @@ def key_for(name):
     return key
 
 
-def run_plan(plan, headless=False):
+def run_plan(plan, headless=False, browser=DEFAULT_BROWSER):
     from seleniumbase import SB
 
+    validate_plan(plan)
     steps = plan["steps"]
     site = plan.get("site", "")
     print("\nLaunching LibreWolf (%s mode) ..." % ("headless" if headless else "GUI"))
@@ -264,11 +369,12 @@ def run_plan(plan, headless=False):
     run_dir = os.path.join(OUT_DIR, "run_" + ts)
     os.makedirs(run_dir, exist_ok=True)
     results_log = os.path.join(run_dir, "results.txt")
+    results_json = os.path.join(run_dir, "results.json")
 
     ok_count, fail_count = 0, 0
     failures = []
 
-    with SB(browser=BROWSER, headless=headless, locale_code="en") as sb:
+    with SB(browser=browser, headless=headless, locale_code="en") as sb:
         try:
             if site:
                 print("\n[1/??] Opening %s" % site)
@@ -365,21 +471,15 @@ def run_plan(plan, headless=False):
                     print("%s -> %s OK" % (label, step["element"]))
 
                 elif action == "shot":
-                    fname = step.get("filename", "").strip()
-                    if not fname:
-                        fname = "shot_%02d.png" % idx
-                    if not fname.lower().endswith(".png"):
-                        fname += ".png"
+                    fname = safe_output_name(step.get("filename"),
+                                             "shot_%02d" % idx, ".png")
                     path = os.path.join(run_dir, fname)
                     sb.save_screenshot(path)
                     print("%s -> saved %s" % (label, path))
 
                 elif action == "html":
-                    fname = step.get("filename", "").strip()
-                    if not fname:
-                        fname = "page_%02d.html" % idx
-                    if not fname.lower().endswith(".html"):
-                        fname += ".html"
+                    fname = safe_output_name(step.get("filename"),
+                                             "page_%02d" % idx, ".html")
                     path = os.path.join(run_dir, fname)
                     with open(path, "w", encoding="utf-8") as f:
                         f.write(sb.driver.page_source)
@@ -398,6 +498,11 @@ def run_plan(plan, headless=False):
 
     print("\n" + "=" * 62)
     print("RUN COMPLETE  |  ok: %d   failed: %d" % (ok_count, fail_count))
+    with open(results_json, "w", encoding="utf-8") as f:
+        json.dump({"site": site, "browser": browser, "ok": ok_count,
+                   "failed": fail_count,
+                   "failures": [{"step": i, "action": a, "error": e}
+                                for i, a, e in failures]}, f, indent=2)
     print("Output folder: %s" % run_dir)
     if failures:
         print("-" * 62)
@@ -586,18 +691,19 @@ def interactive():
     if not plan["steps"] and not plan.get("site"):
         print("Nothing to do - the plan is empty.")
         return
+    browser = choose_browser()
     mode = input("Run mode?  (g)ui / (h)eadless  [g]: ").strip().lower()
     headless = mode.startswith("h")
     print("\nStarting automation in 3 seconds - switch to the browser window...")
     time.sleep(3)
-    ok, run_dir, failures = run_plan(plan, headless=headless)
+    ok, run_dir, failures = run_plan(plan, headless=headless, browser=browser)
     try:
         save_plan(plan, LAST_PLAN)
     except Exception:
         pass
     again = input("\nRun again / edit more / exit? (r/e/x) [x]: ").strip().lower()
     if again == "r":
-        run_plan(plan, headless=headless)
+        run_plan(plan, headless=headless, browser=browser)
     elif again == "e":
         interactive()
     else:
@@ -611,6 +717,8 @@ def main():
     ap = argparse.ArgumentParser(description="Web automation console (SeleniumBase + LibreWolf)")
     ap.add_argument("--file", help="run a saved plan JSON directly (non-interactive)")
     ap.add_argument("--headless", action="store_true", help="run without a visible browser window")
+    ap.add_argument("--browser", choices=SUPPORTED_BROWSERS,
+                    help="browser engine to use (default: choose interactively)")
     args = ap.parse_args()
 
     if args.file:
@@ -623,7 +731,8 @@ def main():
             print("!! Could not load plan '%s': %s" % (args.file, e))
             sys.exit(1)
         show_plan(plan)
-        ok, run_dir, failures = run_plan(plan, headless=args.headless)
+        browser = args.browser or DEFAULT_BROWSER
+        ok, run_dir, failures = run_plan(plan, headless=args.headless, browser=browser)
         sys.exit(0 if ok else 1)
     interactive()
 
