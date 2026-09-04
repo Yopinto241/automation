@@ -3,5 +3,6 @@ __pycache__/
 .venv/
 venv/
 last_plan.json
+prefs.json
 output/*
 !output/.gitkeep
